@@ -112,6 +112,83 @@ def base_layout(height=320, xtitle="Time", ytitle="Temperature (°C)"):
         margin=dict(l=55, r=55, t=35, b=50),
     )
 
+# ── New-format pre-processor ──────────────────────────────────────────────────
+def preprocess_new_format(df):
+    """
+    Detect and transform the new datalogger CSV into the app's canonical schema.
+
+    New format is identified by the presence of max_temp, min_temp, temp_1.
+    Computed columns:
+      - Average_Single_Cell_Temp  = mean(temp_1 … temp_N)
+      - MOSFET_Average_Temp       = mean(inverter_temperature_1, inverter_2_temperature_1)
+    Direct renames:
+      max_temp               → Highest_Single_Cell_Temp
+      min_temp               → Lowest_Single_Cell_Temp
+      inverter_temperature_1 → MOSFET_Highest_Temp
+      inverter_fault_status  → Alarm_Single_Core_High_Temp
+      inverter_2_fault_status→ Alarm_MOSFET_Overtemp
+
+    Returns (processed_df, was_new_format: bool).
+    """
+    df = df.dropna(how='all').reset_index(drop=True)
+
+    if not {'max_temp', 'min_temp', 'temp_1'}.issubset(df.columns):
+        return df, False
+
+    # Compute average cell temp from individual sensor columns (temp_1, temp_2, …)
+    temp_sensor_cols = sorted(
+        [c for c in df.columns if c.startswith('temp_') and c[5:].isdigit()],
+        key=lambda x: int(x[5:])
+    )
+    if temp_sensor_cols:
+        df[COL_CELL_AVG] = (
+            df[temp_sensor_cols].apply(pd.to_numeric, errors='coerce').mean(axis=1)
+        )
+
+    # Compute average MOSFET-proxy temp from both inverters
+    inv_cols = [c for c in ['inverter_temperature_1', 'inverter_2_temperature_1']
+                if c in df.columns]
+    if inv_cols:
+        df[COL_MOSFET_AVG] = (
+            df[inv_cols].apply(pd.to_numeric, errors='coerce').mean(axis=1)
+        )
+
+    # Direct column renames
+    # Note: inverter_fault_status / inverter_2_fault_status are charger status codes,
+    # not battery thermal alarms — do NOT map them to COL_ALARM_*.
+    rename = {
+        'max_temp':               COL_CELL_HIGH,
+        'min_temp':               COL_CELL_LOW,
+        'inverter_temperature_1': COL_MOSFET_MAX,
+    }
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+
+    # Detect ambient temp: any column not accounted for by the standard new-format set
+    # maps to COL_AMBIENT. Convention: the onboard ambient sensor will be appended as
+    # the last column once available; until then this block is a no-op.
+    _known = {
+        'timestamp', 'soc', 'max_cell_voltage', 'max_cell_position',
+        'min_cell_voltage', 'min_cell_position', 'cell_voltage_diff',
+        'max_temp_position', 'min_temp_position', 'temp_diff',
+        'inverter_fault_status', 'inverter_2_fault_status',
+        'inverter_2_temperature_1',
+        'inverter_vin', 'inverter_vout', 'inverter_iout',
+        'inverter_fan_speed_1', 'inverter_fan_speed_2',
+        'inverter_2_vin', 'inverter_2_vout', 'inverter_2_iout',
+        'inverter_2_fan_speed_1', 'inverter_2_fan_speed_2',
+        COL_CELL_HIGH, COL_CELL_LOW, COL_CELL_AVG,
+        COL_MOSFET_MAX, COL_MOSFET_AVG,
+    }
+    for _c in list(df.columns):
+        if (_c.startswith('temp_') and _c[5:].isdigit()) or \
+           (_c.startswith('cell_') and _c[5:].isdigit()):
+            _known.add(_c)
+    _extra = [c for c in df.columns if c not in _known]
+    if len(_extra) == 1 and COL_AMBIENT not in df.columns:
+        df = df.rename(columns={_extra[0]: COL_AMBIENT})
+
+    return df, True
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🔋 Battery Thermal\nAnalyzer")
@@ -131,7 +208,7 @@ with st.sidebar:
 
     st.markdown('<div class="sec-hdr">Pack Info</div>', unsafe_allow_html=True)
     pack_id   = st.text_input("Pack / Unit ID",       placeholder="e.g. PACK-001")
-    test_note = st.text_input("Test note (optional)", placeholder="e.g. 1C discharge")
+    test_note = st.text_input("Test note / tags (optional)", placeholder="e.g. fan_v2 1C cooling_mod baseline")
 
     st.markdown("---")
     compare_enabled = st.checkbox("Overlay previous run on chart", value=True)
@@ -174,6 +251,199 @@ def build_df(df_raw):
 tab_main, tab_compare, tab_docs = st.tabs(["📊  Analyzer", "🔍  Compare Runs", "📖  Scoring Guide"])
 
 # ════════════════════════════════════════════════════════════════════════════
+# TAB 3 — DOCS  (rendered first: st.stop() in other tabs would blank this)
+# ════════════════════════════════════════════════════════════════════════════
+with tab_docs:
+    _docs_path = os.path.join(os.path.dirname(__file__), "docs.md")
+    if os.path.exists(_docs_path):
+        st.markdown(open(_docs_path, encoding="utf-8").read())
+    else:
+        st.warning("docs.md not found — expected alongside app.py.")
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 2 — COMPARE RUNS  (rendered before tab_main: st.stop() in tab_main would blank this)
+# ════════════════════════════════════════════════════════════════════════════
+with tab_compare:
+    st.title("Compare Runs")
+    st.markdown("Filter saved runs from the database and compare them side-by-side.")
+
+    all_ids = get_pack_ids(DB_PATH)
+    if not all_ids:
+        st.info("No saved runs yet. Upload a CSV in the Analyzer tab and click Save.")
+    else:
+        # ── Filter panel ─────────────────────────────────────────────────────
+        fc1, fc2, fc3, fc4 = st.columns(4)
+        with fc1:
+            sel_packs = st.multiselect("Pack ID(s)", all_ids, default=all_ids)
+        with fc2:
+            verdict_opts = ["PASS","CAUTION","FAIL"]
+            sel_verdicts = st.multiselect("Verdict", verdict_opts, default=verdict_opts)
+        with fc3:
+            score_min, score_max = st.slider("Score range", 0, 100, (0, 100))
+        with fc4:
+            max_runs = st.number_input("Max runs to show", value=20, min_value=1, max_value=100)
+
+        fk1, fk2 = st.columns([3, 1])
+        with fk1:
+            note_kw = st.text_input(
+                "Search notes / tags",
+                placeholder="e.g. fan_v2   or   cooling_mod   or   baseline  (space = AND, comma = OR)",
+            )
+        with fk2:
+            kw_mode = st.radio("Match mode", ["AND", "OR"], horizontal=True)
+
+        # Fetch and filter
+        all_runs = []
+        for pid in (sel_packs if sel_packs else all_ids):
+            all_runs.extend(get_all_runs(DB_PATH, pid))
+
+        df_runs = pd.DataFrame(all_runs) if all_runs else pd.DataFrame()
+
+        if df_runs.empty:
+            st.info("No runs match the current filters.")
+        else:
+            if "verdict" in df_runs.columns:
+                df_runs = df_runs[df_runs["verdict"].isin(sel_verdicts)]
+            if "score" in df_runs.columns:
+                df_runs = df_runs[(df_runs["score"] >= score_min) & (df_runs["score"] <= score_max)]
+
+            if note_kw.strip() and "note" in df_runs.columns:
+                if "," in note_kw:
+                    terms = [t.strip() for t in note_kw.split(",") if t.strip()]
+                    mask = df_runs["note"].fillna("").str.contains("|".join(terms), case=False, regex=True)
+                else:
+                    terms = note_kw.split()
+                    if kw_mode == "AND":
+                        mask = pd.Series([True] * len(df_runs), index=df_runs.index)
+                        for t in terms:
+                            mask &= df_runs["note"].fillna("").str.contains(t, case=False, regex=False)
+                    else:
+                        mask = df_runs["note"].fillna("").str.contains("|".join(terms), case=False, regex=True)
+                df_runs = df_runs[mask]
+
+            df_runs = df_runs.head(max_runs).reset_index(drop=True)
+
+            if df_runs.empty:
+                st.info("No runs match the current filters.")
+            else:
+                st.markdown(f"**{len(df_runs)} run(s) matched**")
+
+                # ── Selection table ───────────────────────────────────────────
+                disp_cols = [c for c in ["pack_id","timestamp","score","verdict","ss_value",
+                    "max_delta","max_rise_cs","max_mosfet_delta","peak_cell","mosfet_peak",
+                    "alarm_cell","note"] if c in df_runs.columns]
+                col_rename = {
+                    "pack_id":"Pack","timestamp":"Timestamp","score":"Score","verdict":"Verdict",
+                    "ss_value":"SS Temp","max_delta":"Max ΔT","max_rise_cs":"Rise (°C/s)",
+                    "max_mosfet_delta":"MOSFET ΔT","peak_cell":"Peak Cell",
+                    "mosfet_peak":"Peak MOSFET","alarm_cell":"Alarm","note":"Note"
+                }
+
+                df_display = df_runs[disp_cols].rename(columns=col_rename).copy()
+                df_display.insert(0, "Select", False)
+
+                edited = st.data_editor(df_display, use_container_width=True, hide_index=True,
+                                        column_config={"Select": st.column_config.CheckboxColumn("Select")},
+                                        disabled=[c for c in df_display.columns if c != "Select"])
+
+                selected_idx = edited[edited["Select"]].index.tolist()
+
+                if not selected_idx:
+                    st.caption("☝️  Check rows above to compare up to 5 runs.")
+                else:
+                    if len(selected_idx) > 5:
+                        st.warning("Select up to 5 runs for comparison.")
+                        selected_idx = selected_idx[:5]
+
+                    selected_runs = df_runs.iloc[selected_idx].reset_index(drop=True)
+
+                    # ── Overlay chart ─────────────────────────────────────────
+                    st.markdown("---")
+                    st.markdown("### Temperature Overlay — Highest Cell Temp")
+                    COMPARE_COLORS = ["#3b82f6","#f97316","#10b981","#8b5cf6","#ef4444"]
+
+                    fig_cmp = go.Figure()
+                    for i, (_, row) in enumerate(selected_runs.iterrows()):
+                        run_df, run_tc = get_run_by_id(DB_PATH, row["id"])
+                        if run_df is None or COL_CELL_HIGH not in run_df.columns:
+                            continue
+                        try:
+                            rx = pd.to_datetime(run_df[run_tc], dayfirst=True)
+                            run_df["_elapsed_min"] = (rx - rx.iloc[0]).dt.total_seconds() / 60.0
+                        except Exception:
+                            run_df["_elapsed_min"] = _parse_timestamps(run_df[run_tc]) / 60.0
+
+                        lbl = f"{row.get('pack_id','?')} · {str(row.get('timestamp',''))[:16]} · {row.get('verdict','?')} · {int(row.get('score',0))}"
+                        fig_cmp.add_trace(go.Scatter(
+                            x=run_df["_elapsed_min"], y=run_df[COL_CELL_HIGH],
+                            name=lbl, line=dict(color=COMPARE_COLORS[i % 5], width=2),
+                            hovertemplate=f"<b>{lbl}</b><br>Elapsed: %{{x:.1f}} min<br>T: %{{y:.2f}}°C<extra></extra>"
+                        ))
+                        if COL_CELL_LOW in run_df.columns:
+                            fig_cmp.add_trace(go.Scatter(
+                                x=run_df["_elapsed_min"], y=run_df[COL_CELL_LOW],
+                                name=f"Low ({row.get('pack_id','?')})",
+                                line=dict(color=COMPARE_COLORS[i % 5], width=1, dash="dot"),
+                                opacity=0.4, showlegend=False,
+                                hovertemplate=f"Cell Low<br>T: %{{y:.2f}}°C<extra></extra>"
+                            ))
+
+                    fig_cmp.add_hline(y=warn_cell, line_dash="dash", line_color="#f59e0b",
+                                      annotation_text=f"Warn {warn_cell}°C")
+                    fig_cmp.add_hline(y=override_cell, line_dash="dash", line_color="#ef4444",
+                                      annotation_text=f"Override {override_cell}°C")
+                    fig_cmp.update_layout(**base_layout(height=420, xtitle="Elapsed time (min)", ytitle="Temperature (°C)"))
+                    st.plotly_chart(fig_cmp, use_container_width=True)
+
+                    # ── Side-by-side metrics table ────────────────────────────
+                    st.markdown("### Metrics Comparison")
+
+                    metric_rows = {
+                        "Score":              "score",
+                        "Verdict":            "verdict",
+                        "SS Cell Temp (°C)":  "ss_value",
+                        "Amb → Cell ΔT (°C)": "max_amb_delta",
+                        "Max Cell ΔT (°C)":   "max_delta",
+                        "Max Rise (°C/s)":    "max_rise_cs",
+                        "Max MOSFET ΔT (°C)": "max_mosfet_delta",
+                        "Peak Cell (°C)":     "peak_cell",
+                        "Peak MOSFET (°C)":   "mosfet_peak",
+                        "Thermal Dose":       "thermal_dose",
+                        "Alarm":              "alarm_cell",
+                        "Note":               "note",
+                    }
+
+                    compare_table = {"Metric": list(metric_rows.keys())}
+                    best_score = selected_runs["score"].max() if "score" in selected_runs.columns else None
+
+                    for _, row in selected_runs.iterrows():
+                        col_hdr = f"{row.get('pack_id','?')} · {str(row.get('timestamp',''))[:16]}"
+                        vals = []
+                        for label, db_col in metric_rows.items():
+                            v = row.get(db_col, "—")
+                            if v is None or (isinstance(v, float) and np.isnan(v)):
+                                vals.append("—")
+                            elif isinstance(v, float):
+                                vals.append(f"{v:.2f}")
+                            else:
+                                vals.append(str(v))
+                        compare_table[col_hdr] = vals
+
+                    st.dataframe(pd.DataFrame(compare_table).set_index("Metric"),
+                                 use_container_width=True)
+
+                    if best_score and len(selected_runs) > 1:
+                        st.markdown("**Score delta vs best run in selection:**")
+                        delta_data = {"Pack · Timestamp": [], "Score": [], "Delta vs Best": []}
+                        for _, row in selected_runs.iterrows():
+                            s = row.get("score", 0)
+                            delta_data["Pack · Timestamp"].append(
+                                f"{row.get('pack_id','?')} · {str(row.get('timestamp',''))[:16]}")
+                            delta_data["Score"].append(int(s))
+                            delta_data["Delta vs Best"].append(f"{int(s - best_score):+d}")
+                        st.dataframe(pd.DataFrame(delta_data), use_container_width=True, hide_index=True)
+
+# ════════════════════════════════════════════════════════════════════════════
 # TAB 1 — ANALYZER
 # ════════════════════════════════════════════════════════════════════════════
 with tab_main:
@@ -189,9 +459,9 @@ with tab_main:
             <div style="font-size:18px;font-family:'Space Mono',monospace;
                         margin-top:14px;color:#9ca3af">Upload a CSV to begin</div>
             <div style="margin-top:8px;font-size:12px;color:#4b5563">
-                Expected: Timestamp · Highest/Lowest/Average_Single_Cell_Temp ·
-                MOSFET_Highest/Average_Temp · Ambient_Temp ·
-                BMS_Temp_Average/Highest/Lowest · Alarm columns
+                New format: timestamp · max_temp · min_temp · temp_1…temp_6 · inverter_temperature_1/2
+                <br>Old format: Timestamp · Highest/Lowest/Average_Single_Cell_Temp ·
+                MOSFET_Highest/Average_Temp · Ambient_Temp · BMS_Temp_* · Alarm columns
             </div>
         </div>""", unsafe_allow_html=True)
         if pack_id:
@@ -203,6 +473,20 @@ with tab_main:
         df_raw = pd.read_csv(uploaded)
     except Exception as e:
         st.error(f"Could not read CSV: {e}"); st.stop()
+
+    df_raw, is_new_format = preprocess_new_format(df_raw)
+    if is_new_format:
+        _amb_note = (
+            "Ambient temperature column auto-detected and mapped."
+            if COL_AMBIENT in df_raw.columns
+            else "No ambient sensor column found — Ambient ΔT metric will be skipped."
+        )
+        st.info(
+            "**New datalogger format detected** — columns auto-mapped. "
+            "Inverter temperatures used as MOSFET-proxy readings. "
+            f"{_amb_note} "
+            "Alarm columns are not mapped for this format (no battery thermal alarm signals present)."
+        )
 
     # Auto-detect time column
     time_col = df_raw.columns[0]
@@ -244,6 +528,10 @@ with tab_main:
                      (col_almc, COL_ALARM_CELL),(col_almm, COL_ALARM_MOS)]:
         if src and src != "— none —" and src in df.columns and src != tgt:
             df = df.rename(columns={src: tgt})
+        elif (not src or src == "— none —") and tgt in df.columns:
+            # User explicitly cleared this channel — drop the canonical column so the
+            # scorer treats it as absent rather than reading stale pre-renamed data.
+            df = df.drop(columns=[tgt])
 
     for c in [COL_CELL_HIGH,COL_CELL_LOW,COL_CELL_AVG,
               COL_MOSFET_MAX,COL_MOSFET_AVG,COL_AMBIENT,
@@ -403,8 +691,8 @@ with tab_main:
     rise = metrics.get("max_rise_cs")
     mc(r1[3], "Max Rise Rate (cells)",
        fmt(rise, 4), "°C/s",
-       state="warn" if (rise or 0) >= 1.0 else ("amber" if (rise or 0) >= 0.5 else "ok"),
-       sub="ideal ≤0.2°C/s · fail ≥1.0°C/s")
+       state="warn" if (rise or 0) >= 3.0 else ("amber" if (rise or 0) >= 2.0 else "ok"),
+       sub="ideal ≤1.2°C/s · fail ≥3.0°C/s")
 
     mos_d = metrics.get("max_mosfet_delta")
     mc(r1[4], "Max MOSFET ΔT",
@@ -443,8 +731,8 @@ with tab_main:
     accel = metrics.get("max_accel")
     mc(r2[3], "Max Rise Acceleration",
        fmt(accel, 4) if accel else "—", "°C/s²",
-       state="warn" if (accel or 0) >= 1.0 else "display",
-       sub="runaway signal ≥1.0°C/s²",
+       state="warn" if (accel or 0) >= 5.0 else "display",
+       sub="runaway signal ≥5.0°C/s²",
        badge="display")
 
     dose = metrics.get("thermal_dose")
@@ -520,7 +808,8 @@ with tab_main:
         fig_main.add_trace(go.Scatter(
             x=x_axis, y=delta_s, name="Cell ΔT (right axis)",
             line=dict(color=C_DELTA, width=1.5, dash="dot"),
-            hovertemplate="Cell ΔT: %{y:.2f}°C<extra></extra>"
+            hovertemplate="Cell ΔT: %{y:.2f}°C<extra></extra>",
+            visible="legendonly",
         ), secondary_y=True)
 
     # Previous run overlay — highest cell only
@@ -609,179 +898,3 @@ with tab_main:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 2 — COMPARE RUNS
-# ════════════════════════════════════════════════════════════════════════════
-with tab_compare:
-    st.title("Compare Runs")
-    st.markdown("Filter saved runs from the database and compare them side-by-side.")
-
-    all_ids = get_pack_ids(DB_PATH)
-    if not all_ids:
-        st.info("No saved runs yet. Upload a CSV in the Analyzer tab and click Save.")
-        st.stop()
-
-    # ── Filter panel ─────────────────────────────────────────────────────────
-    fc1, fc2, fc3, fc4 = st.columns(4)
-    with fc1:
-        sel_packs = st.multiselect("Pack ID(s)", all_ids, default=all_ids)
-    with fc2:
-        verdict_opts = ["PASS","CAUTION","FAIL"]
-        sel_verdicts = st.multiselect("Verdict", verdict_opts, default=verdict_opts)
-    with fc3:
-        score_min, score_max = st.slider("Score range", 0, 100, (0, 100))
-    with fc4:
-        max_runs = st.number_input("Max runs to show", value=20, min_value=1, max_value=100)
-
-    # Fetch and filter
-    all_runs = []
-    for pid in (sel_packs if sel_packs else all_ids):
-        all_runs.extend(get_all_runs(DB_PATH, pid))
-
-    df_runs = pd.DataFrame(all_runs) if all_runs else pd.DataFrame()
-
-    if df_runs.empty:
-        st.info("No runs match the current filters.")
-        st.stop()
-
-    if "verdict" in df_runs.columns:
-        df_runs = df_runs[df_runs["verdict"].isin(sel_verdicts)]
-    if "score" in df_runs.columns:
-        df_runs = df_runs[(df_runs["score"] >= score_min) & (df_runs["score"] <= score_max)]
-
-    df_runs = df_runs.head(max_runs).reset_index(drop=True)
-
-    if df_runs.empty:
-        st.info("No runs match the current filters.")
-        st.stop()
-
-    st.markdown(f"**{len(df_runs)} run(s) matched**")
-
-    # ── Selection table ───────────────────────────────────────────────────────
-    disp_cols = [c for c in ["pack_id","timestamp","score","verdict","ss_value",
-        "max_delta","max_rise_cs","max_mosfet_delta","peak_cell","mosfet_peak",
-        "alarm_cell","note"] if c in df_runs.columns]
-    col_rename = {
-        "pack_id":"Pack","timestamp":"Timestamp","score":"Score","verdict":"Verdict",
-        "ss_value":"SS Temp","max_delta":"Max ΔT","max_rise_cs":"Rise (°C/s)",
-        "max_mosfet_delta":"MOSFET ΔT","peak_cell":"Peak Cell",
-        "mosfet_peak":"Peak MOSFET","alarm_cell":"Alarm","note":"Note"
-    }
-
-    # Add select checkboxes via data editor
-    df_display = df_runs[disp_cols].rename(columns=col_rename).copy()
-    df_display.insert(0, "Select", False)
-
-    edited = st.data_editor(df_display, use_container_width=True, hide_index=True,
-                            column_config={"Select": st.column_config.CheckboxColumn("Select")},
-                            disabled=[c for c in df_display.columns if c != "Select"])
-
-    selected_idx = edited[edited["Select"]].index.tolist()
-
-    if not selected_idx:
-        st.caption("☝️  Check rows above to compare up to 5 runs.")
-        st.stop()
-
-    if len(selected_idx) > 5:
-        st.warning("Select up to 5 runs for comparison.")
-        selected_idx = selected_idx[:5]
-
-    selected_runs = df_runs.iloc[selected_idx].reset_index(drop=True)
-
-    # ── Overlay chart ─────────────────────────────────────────────────────────
-    st.markdown("---")
-    st.markdown("### Temperature Overlay — Highest Cell Temp")
-    COMPARE_COLORS = ["#3b82f6","#f97316","#10b981","#8b5cf6","#ef4444"]
-
-    fig_cmp = go.Figure()
-    for i, (_, row) in enumerate(selected_runs.iterrows()):
-        run_df, run_tc = get_run_by_id(DB_PATH, row["id"])
-        if run_df is None or COL_CELL_HIGH not in run_df.columns:
-            continue
-        try:
-            rx = pd.to_datetime(run_df[run_tc], dayfirst=True)
-            run_df["_elapsed_min"] = (rx - rx.iloc[0]).dt.total_seconds() / 60.0
-        except Exception:
-            run_df["_elapsed_min"] = _parse_timestamps(run_df[run_tc]) / 60.0
-
-        lbl = f"{row.get('pack_id','?')} · {str(row.get('timestamp',''))[:16]} · {row.get('verdict','?')} · {int(row.get('score',0))}"
-        fig_cmp.add_trace(go.Scatter(
-            x=run_df["_elapsed_min"], y=run_df[COL_CELL_HIGH],
-            name=lbl, line=dict(color=COMPARE_COLORS[i % 5], width=2),
-            hovertemplate=f"<b>{lbl}</b><br>Elapsed: %{{x:.1f}} min<br>T: %{{y:.2f}}°C<extra></extra>"
-        ))
-        # Also add cell low if available for fill
-        if COL_CELL_LOW in run_df.columns:
-            fig_cmp.add_trace(go.Scatter(
-                x=run_df["_elapsed_min"], y=run_df[COL_CELL_LOW],
-                name=f"Low ({row.get('pack_id','?')})",
-                line=dict(color=COMPARE_COLORS[i % 5], width=1, dash="dot"),
-                opacity=0.4, showlegend=False,
-                hovertemplate=f"Cell Low<br>T: %{{y:.2f}}°C<extra></extra>"
-            ))
-
-    fig_cmp.add_hline(y=warn_cell, line_dash="dash", line_color="#f59e0b",
-                      annotation_text=f"Warn {warn_cell}°C")
-    fig_cmp.add_hline(y=override_cell, line_dash="dash", line_color="#ef4444",
-                      annotation_text=f"Override {override_cell}°C")
-    fig_cmp.update_layout(**base_layout(height=420, xtitle="Elapsed time (min)", ytitle="Temperature (°C)"))
-    st.plotly_chart(fig_cmp, use_container_width=True)
-
-    # ── Side-by-side metrics table ────────────────────────────────────────────
-    st.markdown("### Metrics Comparison")
-
-    metric_rows = {
-        "Score":           "score",
-        "Verdict":         "verdict",
-        "SS Cell Temp (°C)": "ss_value",
-        "Amb → Cell ΔT (°C)": "max_amb_delta",
-        "Max Cell ΔT (°C)":   "max_delta",
-        "Max Rise (°C/s)":    "max_rise_cs",
-        "Max MOSFET ΔT (°C)": "max_mosfet_delta",
-        "Peak Cell (°C)":     "peak_cell",
-        "Peak MOSFET (°C)":   "mosfet_peak",
-        "Thermal Dose":       "thermal_dose",
-        "Alarm":              "alarm_cell",
-        "Note":               "note",
-    }
-
-    compare_table = {"Metric": list(metric_rows.keys())}
-    best_score = selected_runs["score"].max() if "score" in selected_runs.columns else None
-
-    for _, row in selected_runs.iterrows():
-        col_hdr = f"{row.get('pack_id','?')} · {str(row.get('timestamp',''))[:16]}"
-        vals = []
-        for label, db_col in metric_rows.items():
-            v = row.get(db_col, "—")
-            if v is None or (isinstance(v, float) and np.isnan(v)):
-                vals.append("—")
-            elif isinstance(v, float):
-                vals.append(f"{v:.2f}")
-            else:
-                vals.append(str(v))
-        compare_table[col_hdr] = vals
-
-    st.dataframe(pd.DataFrame(compare_table).set_index("Metric"),
-                 use_container_width=True)
-
-    # Score delta vs best
-    if best_score and len(selected_runs) > 1:
-        st.markdown("**Score delta vs best run in selection:**")
-        delta_data = {"Pack · Timestamp": [], "Score": [], "Delta vs Best": []}
-        for _, row in selected_runs.iterrows():
-            s = row.get("score", 0)
-            delta_data["Pack · Timestamp"].append(
-                f"{row.get('pack_id','?')} · {str(row.get('timestamp',''))[:16]}")
-            delta_data["Score"].append(int(s))
-            delta_data["Delta vs Best"].append(f"{int(s - best_score):+d}")
-        st.dataframe(pd.DataFrame(delta_data), use_container_width=True, hide_index=True)
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# TAB 3 — DOCS
-# ════════════════════════════════════════════════════════════════════════════
-with tab_docs:
-    docs_path = os.path.join(os.path.dirname(__file__), "docs.md")
-    if os.path.exists(docs_path):
-        st.markdown(open(docs_path, encoding="utf-8").read())
-    else:
-        st.warning("docs.md not found.")

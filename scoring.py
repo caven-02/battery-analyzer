@@ -40,7 +40,7 @@ def _score(x, w_max, x_ideal, x_fail):
 score_ss   = lambda t_ss:      _score(t_ss,    20, 35.0, 55.0)   # steady-state cell temp
 score_amb  = lambda dt_amb:    _score(dt_amb,  20, 10.0, 25.0)   # ambient-to-cell deltaT
 score_uni  = lambda dt_cell:   _score(dt_cell, 40,  2.0,  5.0)   # cell uniformity
-score_rise = lambda rise_cs:   _score(rise_cs, 10,  0.2,  1.0)   # rise rate °C/s
+score_rise = lambda rise_cs:   _score(rise_cs, 10,  1.2,  3.0)   # rise rate °C/s
 score_mos  = lambda dt_mos:    _score(dt_mos,  10, 10.0, 30.0)   # MOSFET deltaT
 
 def _smooth(series, window=3):
@@ -50,7 +50,11 @@ def _parse_timestamps(ts_series):
     """Return elapsed seconds as float Series. Tries datetime, then numeric."""
     try:
         parsed = pd.to_datetime(ts_series, dayfirst=True)
-        return (parsed - parsed.iloc[0]).dt.total_seconds()
+        elapsed = (parsed - parsed.iloc[0]).dt.total_seconds()
+        # If total duration < 1 s, pandas misread integers as epoch nanoseconds — fall through
+        if elapsed.max() < 1.0:
+            raise ValueError("duration too short")
+        return elapsed
     except Exception:
         numeric = pd.to_numeric(ts_series, errors="coerce")
         t0 = numeric.iloc[0]
@@ -350,7 +354,7 @@ def score_run(metrics, thresholds):
     }
     breakdown["Max Rise Rate"] = {
         "points": round(s_rise, 1), "max": 10, "is_override": False,
-        "detail": f"{rise:.4f}°C/s  |  ideal ≤0.2°C/s  |  fail ≥1.0°C/s"
+        "detail": f"{rise:.4f}°C/s  |  ideal ≤1.2°C/s  |  fail ≥3.0°C/s"
         if rise is not None else "No data"
     }
     breakdown["Max MOSFET ΔT"] = {

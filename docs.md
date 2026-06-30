@@ -16,6 +16,49 @@ This tool processes temperature telemetry exported from battery pack test equipm
 
 ## Expected CSV format
 
+The app auto-detects which format is in use based on the presence of `max_temp`, `min_temp`, and `temp_1` columns.
+
+### New datalogger format (auto-detected)
+
+Timestamp format: ISO 8601 with timezone offset — `2026-06-10T03:45:10.849+00:00`
+
+| Column | Description | Mapped to |
+|---|---|---|
+| `timestamp` | ISO 8601 timestamp with UTC offset | Time axis |
+| `step_name` | Charge/discharge step label | Display only |
+| `soc` | State of charge (%) | Display only |
+| `max_temp` | Peak cell temperature across all modules | Highest cell temp |
+| `min_temp` | Lowest cell temperature across all modules | Lowest cell temp |
+| `temp_1` … `temp_N` | Individual cell temperature sensors | Averaged → mean cell temp |
+| `max_temp_position` | Position index of hottest cell | Display only |
+| `min_temp_position` | Position index of coldest cell | Display only |
+| `temp_diff` | max_temp − min_temp (raw) | Display only |
+| `max_cell_voltage` | Peak cell voltage | Display only |
+| `min_cell_voltage` | Minimum cell voltage | Display only |
+| `max_cell_position` | Position index of highest-voltage cell | Display only |
+| `min_cell_position` | Position index of lowest-voltage cell | Display only |
+| `cell_voltage_diff` | Voltage spread across cells | Display only |
+| `cell_01_voltage` … `cell_N_voltage` | Individual cell voltages | Display only |
+| `inverter_temperature_1` | Inverter 1 temperature | MOSFET highest temp |
+| `inverter_2_temperature_1` | Inverter 2 temperature | Averaged with inverter 1 → MOSFET mean temp |
+| `inverter_vin/vout/iout` | Inverter 1 electrical readings | Display only |
+| `inverter_2_vin/vout/iout` | Inverter 2 electrical readings | Display only |
+| `inverter_fan_speed_1/2` | Inverter 1 fan speeds | Display only |
+| `inverter_2_fan_speed_1/2` | Inverter 2 fan speeds | Display only |
+| `inverter_fault_status` | Inverter 1 state register (64 = charging) | Not mapped — not a battery alarm |
+| `inverter_2_fault_status` | Inverter 2 state register | Not mapped — not a battery alarm |
+| *(last column, optional)* | Ambient temperature from onboard sensor | Ambient temp (when present) |
+
+Alarm columns are not present in this format and do not affect scoring.
+
+BMS temperature columns are not present in this format.
+
+---
+
+### Legacy format
+
+Timestamp format: `dd/mm/yyyy HH:MM:SS`
+
 | Column | Description |
 |---|---|
 | `Timestamp` | `dd/mm/yyyy HH:MM:SS` |
